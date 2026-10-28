@@ -5,6 +5,8 @@ import json
 import hashlib
 import html
 import urllib.request
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
@@ -119,7 +121,6 @@ def scrape_channels():
         if not posts:
             continue
 
-        # Extract numeric IDs
         page_ids = []
         for post_id, _ in posts:
             m = re.search(r'/(\d+)$', post_id)
@@ -199,7 +200,27 @@ def scrape_channels():
             save_history()
 
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Telegram Bot is running healthy!\n")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
+
 def main():
+    # Start dummy web server for Render / Cloud health check
+    threading.Thread(target=run_health_server, daemon=True).start()
+
     print(f"=== Scheduled Reposter (NEW MEMES ONLY) for {TARGET_CHANNEL} Started ===")
     print(f"Schedule: every hour at :05, :25, :45. In queue: {len(queue_items)}")
     
