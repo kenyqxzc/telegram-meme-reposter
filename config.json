@@ -1,0 +1,37 @@
+{
+  "bot_token": "9128472584:AAGVHN1v8IHjI5OHd_f8Nktz59kKp43g4pI",
+  "target_channel": "@LoverTea228_2",
+  "source_channels": [
+    "plohoyrusski",
+    "memepaga_oficial",
+    "tupi4ek_degradanta",
+    "MEMCC2",
+    "legushenkatg",
+    "memepage64",
+    "MONSTRCOCK",
+    "leninstreet",
+    "milkopechenegi",
+    "coldmother",
+    "otval_pizd777"
+  ],
+  "schedule_minutes": [5, 25, 45],
+  "check_interval_seconds": 60,
+  "ad_keywords": [
+    "erid",
+    "реклама",
+    "промокод",
+    "скидк",
+    "подпишись",
+    "подписывайся",
+    "канал",
+    "переходи",
+    "ставки",
+    "1xbet",
+    "казино",
+    "крипт",
+    "розыгрыш",
+    "акци",
+    "t.me/",
+    "@"
+  ]
+}
