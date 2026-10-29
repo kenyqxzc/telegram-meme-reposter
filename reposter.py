@@ -3,6 +3,7 @@ import sys
 import re
 import time
 import json
+import random
 import hashlib
 import html
 import urllib.request
@@ -136,6 +137,35 @@ def is_ad(text: str) -> bool:
         return False
     lower = text.lower()
     return any(kw in lower for kw in AD_KEYWORDS)
+
+
+def is_already_in_channel(target_hash: str) -> bool:
+    """Checks the last few posts of the target channel to ensure this image wasn't just posted by another instance."""
+    try:
+        chan_name = TARGET_CHANNEL.lstrip("@")
+        url = f"https://t.me/s/{chan_name}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            content = resp.read().decode("utf-8", errors="ignore")
+        
+        photos = re.findall(r"background-image:url\('([^']+)'\)", content)
+        for p_url in photos[-6:]:
+            if "emoji" in p_url:
+                continue
+            try:
+                p_req = urllib.request.Request(p_url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(p_req, timeout=10) as p_resp:
+                    p_bytes = p_resp.read()
+                if len(p_bytes) < 2000:
+                    continue
+                p_hash = hashlib.md5(p_bytes).hexdigest()
+                if p_hash == target_hash:
+                    return True
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"    [!] Error checking channel for duplicates: {e}", flush=True)
+    return False
 
 
 def send_telegram_photo(caption: str, file_path: str) -> bool:
@@ -345,6 +375,17 @@ def main():
                 if queue_items:
                     item = queue_items.pop(0)
                     save_queue()
+
+                    # Add random 1-4s jitter to prevent race condition between multiple instances
+                    time.sleep(random.uniform(1.0, 4.0))
+
+                    # Channel-level deduplication check
+                    if is_already_in_channel(item["hash"]):
+                        print(f"    [SKIP] Meme {item['hash'][:8]} already in {TARGET_CHANNEL}! Skipping duplicate.", flush=True)
+                        if os.path.exists(item["file_path"]):
+                            os.remove(item["file_path"])
+                        continue
+
                     print(f"    [POSTING] Sending to {TARGET_CHANNEL}...", flush=True)
                     ok = send_telegram_photo(item["caption"], item["file_path"])
                     if ok:
