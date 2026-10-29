@@ -28,6 +28,10 @@ TARGET_CHANNEL = config["target_channel"]
 SOURCE_CHANNELS = config["source_channels"]
 SCHEDULE_MINUTES = config.get("schedule_minutes", [5, 25, 45])
 AD_KEYWORDS = [kw.lower() for kw in config.get("ad_keywords", [])]
+ADMIN_USERNAME = config.get("admin_username", "truekent").lstrip("@").lower()
+
+admin_chat_id = None
+last_sent_errors = {}
 
 # History
 h_data = {}
@@ -40,6 +44,8 @@ if os.path.exists(HISTORY_FILE):
 
 last_post_ids = h_data.get("last_post_ids", {})
 history_hashes = set(h_data.get("image_hashes", []))
+if "admin_chat_id" in h_data:
+    admin_chat_id = h_data["admin_chat_id"]
 
 # Queue
 queue_items = []
@@ -57,6 +63,7 @@ def save_history():
             {
                 "last_post_ids": last_post_ids,
                 "image_hashes": list(history_hashes)[-5000:],
+                "admin_chat_id": admin_chat_id
             },
             f,
             ensure_ascii=False,
@@ -69,6 +76,61 @@ def save_queue():
         json.dump(queue_items, f, ensure_ascii=False, indent=2)
 
 
+def check_for_admin_updates():
+    """Checks if @truekent started the bot to acquire their chat_id."""
+    global admin_chat_id
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        for update in data.get("result", []):
+            msg = update.get("message", {})
+            user = msg.get("from", {})
+            uname = user.get("username", "").lower()
+            if uname == ADMIN_USERNAME:
+                cid = user.get("id")
+                if cid and cid != admin_chat_id:
+                    admin_chat_id = cid
+                    save_history()
+                    print(f"[ADMIN] Detected @{uname} with chat_id={admin_chat_id}. Notifications active!", flush=True)
+                    send_admin_message(f"✅ Уведомления об ошибках бота для канала {TARGET_CHANNEL} успешно подключены!")
+    except Exception:
+        pass
+
+
+def send_admin_message(text: str):
+    """Sends a brief direct message to the admin if chat_id is known."""
+    if not admin_chat_id:
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = json.dumps({"chat_id": admin_chat_id, "text": text}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            pass
+    except Exception:
+        pass
+
+
+def notify_error(brief_error: str):
+    """Reports a brief error to admin, preventing spam of the same message within 15 minutes."""
+    now = time.time()
+    last_time = last_sent_errors.get(brief_error, 0)
+    if now - last_time < 900: # 15 minutes throttle per unique error
+        return
+    last_sent_errors[brief_error] = now
+    
+    text = f"⚠️ [Ошибка бота]:\n{brief_error}"
+    print(f"[ALERT] {text}", flush=True)
+    send_admin_message(text)
+
+
 def is_ad(text: str) -> bool:
     if not text:
         return False
@@ -78,6 +140,7 @@ def is_ad(text: str) -> bool:
 
 def send_telegram_photo(caption: str, file_path: str) -> bool:
     if not os.path.exists(file_path):
+        notify_error(f"Файл {file_path} не найден на диске для публикации.")
         return False
     with open(file_path, "rb") as f:
         image_bytes = f.read()
@@ -102,9 +165,13 @@ def send_telegram_photo(caption: str, file_path: str) -> bool:
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            return data.get("ok", False)
+            if not data.get("ok", False):
+                notify_error(f"Не удалось отправить фото в {TARGET_CHANNEL}: {data.get('description')}")
+                return False
+            return True
     except Exception as e:
         print(f"    [!] Telegram error: {e}", flush=True)
+        notify_error(f"Ошибка API при отправке поста в {TARGET_CHANNEL}: {e}")
         return False
 
 
@@ -118,6 +185,7 @@ def scrape_channels():
             with urllib.request.urlopen(req, timeout=15) as resp:
                 content = resp.read().decode("utf-8", errors="ignore")
         except Exception as e:
+            notify_error(f"Канал @{channel} недоступен для чтения ({e}).")
             continue
 
         posts = re.findall(
@@ -137,9 +205,7 @@ def scrape_channels():
             continue
         max_page_id = max(page_ids)
 
-        # Baseline initialization: if channel seen for first time, look back only up to 2 hours
         if channel not in last_post_ids:
-            # Find posts older than 2 hours as baseline
             baseline_id = max_page_id
             for post_id, block in reversed(posts):
                 time_match = re.search(r'<time datetime="([^"]+)"', block)
@@ -155,7 +221,7 @@ def scrape_channels():
                         pass
             last_post_ids[channel] = baseline_id
             save_history()
-            print(f"[INIT] @{channel} baseline set to #{baseline_id} (monitoring new posts)", flush=True)
+            print(f"[INIT] @{channel} baseline set to #{baseline_id}", flush=True)
 
         last_seen = last_post_ids[channel]
 
@@ -165,7 +231,6 @@ def scrape_channels():
                 continue
             num_id = int(m.group(1))
             
-            # Skip old history
             if num_id <= last_seen:
                 continue
 
@@ -182,7 +247,6 @@ def scrape_channels():
                 text = html.unescape(text).strip()
 
             if is_ad(text):
-                print(f"    [!] Skipped Ad: {post_id}", flush=True)
                 continue
 
             for p_url in photos:
@@ -213,6 +277,7 @@ def scrape_channels():
                     print(f"    [+ NEW MEME] Captured #{num_id} from @{channel}! In queue: {len(queue_items)}", flush=True)
                 except Exception as ex:
                     print(f"    [!] Download error: {ex}", flush=True)
+                    notify_error(f"Не удалось скачать фото из @{channel} (пост #{num_id}).")
 
         if max_page_id > last_seen:
             last_post_ids[channel] = max_page_id
@@ -237,10 +302,8 @@ def run_health_server():
 
 
 def keep_alive_worker():
-    """Pings self URL every 10 minutes to prevent Render Free tier from spinning down."""
-    # Render provides RENDER_EXTERNAL_URL automatically, fallback to known service name
     url = os.environ.get("RENDER_EXTERNAL_URL", "https://telegram-meme-reposter.onrender.com")
-    time.sleep(30) # wait for server to start
+    time.sleep(30)
     while True:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "KeepAlive/1.0"})
@@ -248,26 +311,31 @@ def keep_alive_worker():
                 pass
         except Exception:
             pass
-        time.sleep(600) # every 10 minutes
+        time.sleep(600)
 
 
 def main():
-    # 1. Start HTTP server for Render health check
     threading.Thread(target=run_health_server, daemon=True).start()
-
-    # 2. Start Keep-Alive self-pinger to prevent sleeping
     threading.Thread(target=keep_alive_worker, daemon=True).start()
 
     print(f"=== Scheduled Reposter (NEW MEMES ONLY) for {TARGET_CHANNEL} Started ===", flush=True)
+    print(f"Admin notifications configured for @{ADMIN_USERNAME}", flush=True)
     print(f"Schedule: every hour at :05, :25, :45. In queue: {len(queue_items)}", flush=True)
     
     last_slot = ""
     last_scrape = 0
+    last_admin_check = 0
 
     while True:
         now = datetime.now()
         minute = now.minute
         slot_id = now.strftime("%Y-%m-%d %H:") + f"{minute:02d}"
+
+        # Periodically check if admin started the bot
+        if time.time() - last_admin_check > 30:
+            last_admin_check = time.time()
+            if not admin_chat_id:
+                check_for_admin_updates()
 
         # Scheduled post trigger
         if minute in SCHEDULE_MINUTES:
