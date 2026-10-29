@@ -1,4 +1,5 @@
 import os
+import sys
 import re
 import time
 import json
@@ -7,7 +8,10 @@ import html
 import urllib.request
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime
+from datetime import datetime, timezone
+
+# Ensure line buffering for logs in Docker / Render
+sys.stdout.reconfigure(line_buffering=True)
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
 HISTORY_FILE = os.path.join(os.path.dirname(__file__), "history.json")
@@ -100,18 +104,20 @@ def send_telegram_photo(caption: str, file_path: str) -> bool:
             data = json.loads(resp.read().decode("utf-8"))
             return data.get("ok", False)
     except Exception as e:
-        print(f"    [!] Telegram error: {e}")
+        print(f"    [!] Telegram error: {e}", flush=True)
         return False
 
 
 def scrape_channels():
+    now_utc = datetime.now(timezone.utc)
+
     for channel in SOURCE_CHANNELS:
         url = f"https://t.me/s/{channel}"
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 content = resp.read().decode("utf-8", errors="ignore")
-        except Exception:
+        except Exception as e:
             continue
 
         posts = re.findall(
@@ -131,12 +137,25 @@ def scrape_channels():
             continue
         max_page_id = max(page_ids)
 
-        # Baseline initialization: ignore old history on first run
+        # Baseline initialization: if channel seen for first time, look back only up to 2 hours
         if channel not in last_post_ids:
-            last_post_ids[channel] = max_page_id
+            # Find posts older than 2 hours as baseline
+            baseline_id = max_page_id
+            for post_id, block in reversed(posts):
+                time_match = re.search(r'<time datetime="([^"]+)"', block)
+                if time_match:
+                    try:
+                        p_time = datetime.fromisoformat(time_match.group(1).replace("Z", "+00:00"))
+                        age_seconds = (now_utc - p_time).total_seconds()
+                        if age_seconds < 7200: # within last 2 hours
+                            m = re.search(r'/(\d+)$', post_id)
+                            if m:
+                                baseline_id = int(m.group(1)) - 1
+                    except Exception:
+                        pass
+            last_post_ids[channel] = baseline_id
             save_history()
-            print(f"[INIT] @{channel} set to post #{max_page_id}. Listening for NEW memes only!")
-            continue
+            print(f"[INIT] @{channel} baseline set to #{baseline_id} (monitoring new posts)", flush=True)
 
         last_seen = last_post_ids[channel]
 
@@ -163,7 +182,7 @@ def scrape_channels():
                 text = html.unescape(text).strip()
 
             if is_ad(text):
-                print(f"    [!] Skipped Ad: {post_id}")
+                print(f"    [!] Skipped Ad: {post_id}", flush=True)
                 continue
 
             for p_url in photos:
@@ -191,9 +210,9 @@ def scrape_channels():
                     history_hashes.add(img_hash)
                     save_queue()
                     save_history()
-                    print(f"    [+ NEW MEME] Captured #{num_id} from @{channel}! In queue: {len(queue_items)}")
-                except Exception:
-                    pass
+                    print(f"    [+ NEW MEME] Captured #{num_id} from @{channel}! In queue: {len(queue_items)}", flush=True)
+                except Exception as ex:
+                    print(f"    [!] Download error: {ex}", flush=True)
 
         if max_page_id > last_seen:
             last_post_ids[channel] = max_page_id
@@ -217,12 +236,30 @@ def run_health_server():
     server.serve_forever()
 
 
+def keep_alive_worker():
+    """Pings self URL every 10 minutes to prevent Render Free tier from spinning down."""
+    # Render provides RENDER_EXTERNAL_URL automatically, fallback to known service name
+    url = os.environ.get("RENDER_EXTERNAL_URL", "https://telegram-meme-reposter.onrender.com")
+    time.sleep(30) # wait for server to start
+    while True:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "KeepAlive/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                pass
+        except Exception:
+            pass
+        time.sleep(600) # every 10 minutes
+
+
 def main():
-    # Start dummy web server for Render / Cloud health check
+    # 1. Start HTTP server for Render health check
     threading.Thread(target=run_health_server, daemon=True).start()
 
-    print(f"=== Scheduled Reposter (NEW MEMES ONLY) for {TARGET_CHANNEL} Started ===")
-    print(f"Schedule: every hour at :05, :25, :45. In queue: {len(queue_items)}")
+    # 2. Start Keep-Alive self-pinger to prevent sleeping
+    threading.Thread(target=keep_alive_worker, daemon=True).start()
+
+    print(f"=== Scheduled Reposter (NEW MEMES ONLY) for {TARGET_CHANNEL} Started ===", flush=True)
+    print(f"Schedule: every hour at :05, :25, :45. In queue: {len(queue_items)}", flush=True)
     
     last_slot = ""
     last_scrape = 0
@@ -232,26 +269,28 @@ def main():
         minute = now.minute
         slot_id = now.strftime("%Y-%m-%d %H:") + f"{minute:02d}"
 
+        # Scheduled post trigger
         if minute in SCHEDULE_MINUTES:
             if last_slot != slot_id:
                 last_slot = slot_id
-                print(f"\n[{now.strftime('%H:%M:%S')}] Slot :{minute:02d} triggered!")
+                print(f"\n[{now.strftime('%H:%M:%S')}] Slot :{minute:02d} triggered!", flush=True)
                 if queue_items:
                     item = queue_items.pop(0)
                     save_queue()
-                    print(f"    [POSTING] Sending to {TARGET_CHANNEL}...")
+                    print(f"    [POSTING] Sending to {TARGET_CHANNEL}...", flush=True)
                     ok = send_telegram_photo(item["caption"], item["file_path"])
                     if ok:
-                        print(f"    [SUCCESS] Published! Remaining: {len(queue_items)}")
+                        print(f"    [SUCCESS] Published! Remaining: {len(queue_items)}", flush=True)
                         if os.path.exists(item["file_path"]):
                             os.remove(item["file_path"])
                     else:
-                        print("    [!] Failed to send. Restoring to queue.")
+                        print("    [!] Failed to send. Restoring to queue.", flush=True)
                         queue_items.insert(0, item)
                         save_queue()
                 else:
-                    print(f"    [QUEUE EMPTY] Waiting for fresh memes...")
+                    print(f"    [QUEUE EMPTY] Waiting for fresh memes...", flush=True)
 
+        # Scrape channels every 45s
         if time.time() - last_scrape > 45:
             last_scrape = time.time()
             scrape_channels()
