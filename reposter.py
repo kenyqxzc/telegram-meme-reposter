@@ -35,6 +35,7 @@ SOURCE_CHANNELS = config["source_channels"]
 SCHEDULE_MINUTES = config.get("schedule_minutes", [5, 25, 45])
 AD_KEYWORDS = [kw.lower() for kw in config.get("ad_keywords", [])]
 ADMIN_CHAT_ID = 1248790119  # @Truekent chat ID
+SKIP_POSTS_WITH_CAPTION = config.get("skip_posts_with_caption", True)
 
 last_sent_errors = {}
 last_update_id = 0
@@ -207,6 +208,11 @@ def scrape_channels():
                 text = re.sub(r'<[^>]+>', '', raw_text)
                 text = html.unescape(text).strip()
 
+            # Skip posts that have a caption if configured
+            if SKIP_POSTS_WITH_CAPTION and text:
+                print(f"    [!] Skipped post with caption (#{num_id}): {text[:40]}...", flush=True)
+                continue
+
             if is_ad(text):
                 continue
 
@@ -341,6 +347,15 @@ def main():
                 if queue_items:
                     item = queue_items.pop(0)
                     save_queue()
+
+                    if SKIP_POSTS_WITH_CAPTION and item.get("caption"):
+                        print(f"    [SKIP] Queue item had caption: {item['caption'][:30]}. Skipping.", flush=True)
+                        if os.path.exists(item["file_path"]):
+                            try:
+                                os.remove(item["file_path"])
+                            except Exception:
+                                pass
+                        continue
 
                     print(f"    [POSTING] Sending meme to {TARGET_CHANNEL}...", flush=True)
                     ok = send_telegram_photo(item["caption"], item["file_path"])
